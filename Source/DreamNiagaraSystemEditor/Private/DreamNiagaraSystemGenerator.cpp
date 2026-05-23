@@ -16,8 +16,10 @@
 #include "NiagaraEmitterHandle.h"
 #include "NiagaraGraph.h"
 #include "NiagaraGPUSortInfo.h"
+#include "NiagaraNodeFunctionCall.h"
 #include "NiagaraNodeOutput.h"
 #include "NiagaraRendererProperties.h"
+#include "NiagaraScript.h"
 #include "NiagaraScriptSource.h"
 #include "NiagaraSpriteRendererProperties.h"
 #include "NiagaraSystem.h"
@@ -33,6 +35,31 @@ namespace UE::DreamNiagara::SystemEditor
 {
 	namespace
 	{
+		struct FAddedModuleInfo
+		{
+			Private::EDreamNiagaraStackUsage StackUsage = Private::EDreamNiagaraStackUsage::Unknown;
+			UNiagaraScript* Script = nullptr;
+			int32 Order = INDEX_NONE;
+		};
+
+		struct FPendingDependency
+		{
+			FNiagaraModuleDependency Dependency;
+			Private::EDreamNiagaraStackUsage SourceStackUsage = Private::EDreamNiagaraStackUsage::Unknown;
+			int32 SourceOrder = INDEX_NONE;
+			FString SourceModuleName;
+		};
+
+		struct FStackBuildState
+		{
+			TMap<Private::EDreamNiagaraStackUsage, UNiagaraNodeOutput*> OutputNodes;
+			TMap<Private::EDreamNiagaraStackUsage, UNiagaraScript*> TargetScripts;
+			TArray<FAddedModuleInfo> AddedModules;
+			TArray<FPendingDependency> PendingPostDependencies;
+			TSet<FString> ResolvingDependencies;
+			int32 NextOrder = 0;
+		};
+
 		UNiagaraNodeOutput* FindOutputNodeForStack(UNiagaraEmitter& Emitter, const Private::EDreamNiagaraStackUsage Usage)
 		{
 			FVersionedNiagaraEmitterData* EmitterData = Emitter.GetLatestEmitterData();
@@ -67,6 +94,354 @@ namespace UE::DreamNiagara::SystemEditor
 			}
 
 			return Source->NodeGraph->FindEquivalentOutputNode(Private::ToNiagaraScriptUsage(Usage), UsageId);
+		}
+
+		UNiagaraScript* FindTargetScriptForStack(UNiagaraEmitter& Emitter, const Private::EDreamNiagaraStackUsage Usage)
+		{
+			FVersionedNiagaraEmitterData* EmitterData = Emitter.GetLatestEmitterData();
+			if (!EmitterData)
+			{
+				return nullptr;
+			}
+
+			switch (Usage)
+			{
+			case Private::EDreamNiagaraStackUsage::EmitterSpawn:
+				return EmitterData->EmitterSpawnScriptProps.Script;
+			case Private::EDreamNiagaraStackUsage::EmitterUpdate:
+				return EmitterData->EmitterUpdateScriptProps.Script;
+			case Private::EDreamNiagaraStackUsage::ParticleSpawn:
+				return EmitterData->SpawnScriptProps.Script;
+			case Private::EDreamNiagaraStackUsage::ParticleUpdate:
+				return EmitterData->UpdateScriptProps.Script;
+			default:
+				return nullptr;
+			}
+		}
+
+		bool ResolveStackTarget(
+			UNiagaraEmitter& Emitter,
+			FStackBuildState& State,
+			const Private::EDreamNiagaraStackUsage StackUsage,
+			UNiagaraNodeOutput*& OutOutputNode,
+			UNiagaraScript*& OutTargetScript,
+			FString& OutError)
+		{
+			if (UNiagaraNodeOutput** CachedOutputNode = State.OutputNodes.Find(StackUsage))
+			{
+				OutOutputNode = *CachedOutputNode;
+			}
+			else
+			{
+				OutOutputNode = FindOutputNodeForStack(Emitter, StackUsage);
+				if (!OutOutputNode)
+				{
+					OutError = FString::Printf(TEXT("Could not find Niagara output node for stack usage '%s' in emitter '%s'."), *Private::ToInternalUsageSegment(StackUsage), *Emitter.GetUniqueEmitterName());
+					return false;
+				}
+				State.OutputNodes.Add(StackUsage, OutOutputNode);
+			}
+
+			if (UNiagaraScript** CachedTargetScript = State.TargetScripts.Find(StackUsage))
+			{
+				OutTargetScript = *CachedTargetScript;
+			}
+			else
+			{
+				OutTargetScript = FindTargetScriptForStack(Emitter, StackUsage);
+				if (!OutTargetScript)
+				{
+					OutError = FString::Printf(TEXT("Could not resolve target Niagara script for stack usage '%s' in emitter '%s'."), *Private::ToInternalUsageSegment(StackUsage), *Emitter.GetUniqueEmitterName());
+					return false;
+				}
+				State.TargetScripts.Add(StackUsage, OutTargetScript);
+			}
+
+			return true;
+		}
+
+		bool IsDependencyEvaluatedInUsage(const FNiagaraModuleDependency& Dependency, const Private::EDreamNiagaraStackUsage StackUsage)
+		{
+			ENiagaraModuleDependencyUsage DependencyUsage = ENiagaraModuleDependencyUsage::None;
+			switch (StackUsage)
+			{
+			case Private::EDreamNiagaraStackUsage::EmitterSpawn:
+			case Private::EDreamNiagaraStackUsage::ParticleSpawn:
+			case Private::EDreamNiagaraStackUsage::SystemSpawn:
+				DependencyUsage = ENiagaraModuleDependencyUsage::Spawn;
+				break;
+			case Private::EDreamNiagaraStackUsage::EmitterUpdate:
+			case Private::EDreamNiagaraStackUsage::ParticleUpdate:
+			case Private::EDreamNiagaraStackUsage::SystemUpdate:
+				DependencyUsage = ENiagaraModuleDependencyUsage::Update;
+				break;
+			case Private::EDreamNiagaraStackUsage::ParticleEvent:
+				DependencyUsage = ENiagaraModuleDependencyUsage::Event;
+				break;
+			case Private::EDreamNiagaraStackUsage::SimulationStage:
+				DependencyUsage = ENiagaraModuleDependencyUsage::SimulationStage;
+				break;
+			default:
+				return false;
+			}
+
+			return (Dependency.OnlyEvaluateInScriptUsage & (1 << static_cast<int32>(DependencyUsage))) != 0;
+		}
+
+		bool ModuleProvidesDependency(
+			const FAddedModuleInfo& ModuleInfo,
+			const FNiagaraModuleDependency& Dependency,
+			const Private::EDreamNiagaraStackUsage SourceStackUsage,
+			const int32 SourceOrder)
+		{
+			const FVersionedNiagaraScriptData* ScriptData = ModuleInfo.Script ? ModuleInfo.Script->GetLatestScriptData() : nullptr;
+			if (!ScriptData || !ScriptData->ProvidedDependencies.Contains(Dependency.Id) || !Dependency.IsVersionAllowed(ScriptData->Version))
+			{
+				return false;
+			}
+
+			if (Dependency.ScriptConstraint == ENiagaraModuleDependencyScriptConstraint::SameScript
+				&& ModuleInfo.StackUsage != SourceStackUsage)
+			{
+				return false;
+			}
+
+			if (Dependency.Type == ENiagaraModuleDependencyType::PreDependency)
+			{
+				return ModuleInfo.Order < SourceOrder;
+			}
+			if (Dependency.Type == ENiagaraModuleDependencyType::PostDependency)
+			{
+				return ModuleInfo.Order > SourceOrder;
+			}
+
+			return false;
+		}
+
+		bool IsDependencySatisfied(
+			const FStackBuildState& State,
+			const FNiagaraModuleDependency& Dependency,
+			const Private::EDreamNiagaraStackUsage SourceStackUsage,
+			const int32 SourceOrder)
+		{
+			for (const FAddedModuleInfo& ModuleInfo : State.AddedModules)
+			{
+				if (ModuleProvidesDependency(ModuleInfo, Dependency, SourceStackUsage, SourceOrder))
+				{
+					return true;
+				}
+			}
+
+			return false;
+		}
+
+		FString MakeDependencyResolutionKey(
+			const FNiagaraModuleDependency& Dependency,
+			const Private::EDreamNiagaraStackUsage SourceStackUsage,
+			const int32 SourceOrder)
+		{
+			return FString::Printf(
+				TEXT("%s|%d|%d|%d"),
+				*Dependency.Id.ToString(),
+				static_cast<int32>(Dependency.Type),
+				static_cast<int32>(SourceStackUsage),
+				SourceOrder);
+		}
+
+		bool AddResolvedModuleWithDependencies(
+			Private::FGenerationContext& Context,
+			UNiagaraSystem& System,
+			UNiagaraEmitter& Emitter,
+			FStackBuildState& State,
+			const Private::FResolvedModule& ResolvedModule,
+			const Private::EDreamNiagaraStackUsage StackUsage,
+			const TArray<FDreamNiagaraAssignment>* Inputs,
+			const FString& SourceLabel,
+			FString& OutError)
+		{
+			if (!ResolvedModule.Script)
+			{
+				Context.AddWarning(FString::Printf(TEXT("Skipping module '%s' because it resolved to a null Niagara script."), *SourceLabel));
+				return true;
+			}
+
+			FVersionedNiagaraScriptData* ScriptData = ResolvedModule.Script->GetLatestScriptData();
+			if (!ScriptData)
+			{
+				Context.AddWarning(FString::Printf(TEXT("Skipping module '%s' because its Niagara script data could not be loaded."), *SourceLabel));
+				return true;
+			}
+
+			for (const FNiagaraModuleDependency& Dependency : ScriptData->RequiredDependencies)
+			{
+				if (!IsDependencyEvaluatedInUsage(Dependency, StackUsage)
+					|| Dependency.Type != ENiagaraModuleDependencyType::PreDependency)
+				{
+					continue;
+				}
+
+				if (IsDependencySatisfied(State, Dependency, StackUsage, State.NextOrder))
+				{
+					continue;
+				}
+
+				const FString DependencyKey = MakeDependencyResolutionKey(Dependency, StackUsage, State.NextOrder);
+				if (State.ResolvingDependencies.Contains(DependencyKey))
+				{
+					Context.AddWarning(FString::Printf(
+						TEXT("Skipping recursive pre-dependency '%s' while adding '%s'."),
+						*Dependency.Id.ToString(),
+						*SourceLabel));
+					continue;
+				}
+
+				State.ResolvingDependencies.Add(DependencyKey);
+				Private::FResolvedDependencyProvider Provider;
+				FString ResolveError;
+				if (Private::ResolveDependencyProvider(Dependency, StackUsage, Provider, ResolveError))
+				{
+					UE_LOG(LogDreamNiagara, Display,
+						TEXT("Auto-adding pre-dependency '%s' via module '%s' before '%s'."),
+						*Dependency.Id.ToString(),
+						*GetPathNameSafe(Provider.Module.Script),
+						*SourceLabel);
+					if (!AddResolvedModuleWithDependencies(Context, System, Emitter, State, Provider.Module, Provider.StackUsage, nullptr, Provider.Module.Script->GetName(), OutError))
+					{
+						State.ResolvingDependencies.Remove(DependencyKey);
+						return false;
+					}
+				}
+				else if (!ResolveError.IsEmpty())
+				{
+					Context.AddWarning(FString::Printf(
+						TEXT("Could not auto-add pre-dependency '%s' for module '%s': %s"),
+						*Dependency.Id.ToString(),
+						*SourceLabel,
+						*ResolveError));
+				}
+				State.ResolvingDependencies.Remove(DependencyKey);
+			}
+
+			UNiagaraNodeOutput* OutputNode = nullptr;
+			UNiagaraScript* TargetScript = nullptr;
+			if (!ResolveStackTarget(Emitter, State, StackUsage, OutputNode, TargetScript, OutError))
+			{
+				return false;
+			}
+
+			UNiagaraNodeFunctionCall* ModuleNode = FNiagaraStackGraphUtilities::AddScriptModuleToStack(
+				ResolvedModule.Script,
+				*OutputNode);
+			if (!ModuleNode)
+			{
+				Context.AddWarning(FString::Printf(
+					TEXT("Failed to add module '%s' to stack usage '%s' in emitter '%s'."),
+					*SourceLabel,
+					*Private::ToInternalUsageSegment(StackUsage),
+					*Emitter.GetUniqueEmitterName()));
+				return true;
+			}
+
+			const int32 AddedOrder = State.NextOrder++;
+			FAddedModuleInfo AddedModule;
+			AddedModule.StackUsage = StackUsage;
+			AddedModule.Script = ResolvedModule.Script;
+			AddedModule.Order = AddedOrder;
+			State.AddedModules.Add(AddedModule);
+
+			if (Inputs && !Inputs->IsEmpty())
+			{
+				const FVersionedNiagaraEmitter VersionedEmitter(&Emitter, Emitter.GetExposedVersion().VersionGuid);
+				Private::FModuleInputApplier::ApplyInputs(
+					Context,
+					Emitter.GetUniqueEmitterName(),
+					System,
+					VersionedEmitter,
+					*TargetScript,
+					*ModuleNode,
+					*Inputs);
+			}
+
+			for (const FNiagaraModuleDependency& Dependency : ScriptData->RequiredDependencies)
+			{
+				if (!IsDependencyEvaluatedInUsage(Dependency, StackUsage)
+					|| Dependency.Type != ENiagaraModuleDependencyType::PostDependency)
+				{
+					continue;
+				}
+
+				if (IsDependencySatisfied(State, Dependency, StackUsage, AddedOrder))
+				{
+					continue;
+				}
+
+				FPendingDependency PendingDependency;
+				PendingDependency.Dependency = Dependency;
+				PendingDependency.SourceStackUsage = StackUsage;
+				PendingDependency.SourceOrder = AddedOrder;
+				PendingDependency.SourceModuleName = SourceLabel;
+				State.PendingPostDependencies.Add(PendingDependency);
+			}
+
+			return true;
+		}
+
+		bool ResolvePendingPostDependencies(
+			Private::FGenerationContext& Context,
+			UNiagaraSystem& System,
+			UNiagaraEmitter& Emitter,
+			FStackBuildState& State,
+			FString& OutError)
+		{
+			for (int32 Index = 0; Index < State.PendingPostDependencies.Num(); ++Index)
+			{
+				const FPendingDependency PendingDependency = State.PendingPostDependencies[Index];
+				if (IsDependencySatisfied(State, PendingDependency.Dependency, PendingDependency.SourceStackUsage, PendingDependency.SourceOrder))
+				{
+					continue;
+				}
+
+				const FString DependencyKey = MakeDependencyResolutionKey(
+					PendingDependency.Dependency,
+					PendingDependency.SourceStackUsage,
+					PendingDependency.SourceOrder);
+				if (State.ResolvingDependencies.Contains(DependencyKey))
+				{
+					Context.AddWarning(FString::Printf(
+						TEXT("Skipping recursive post-dependency '%s' while resolving '%s'."),
+						*PendingDependency.Dependency.Id.ToString(),
+						*PendingDependency.SourceModuleName));
+					continue;
+				}
+
+				State.ResolvingDependencies.Add(DependencyKey);
+				Private::FResolvedDependencyProvider Provider;
+				FString ResolveError;
+				if (Private::ResolveDependencyProvider(PendingDependency.Dependency, PendingDependency.SourceStackUsage, Provider, ResolveError))
+				{
+					UE_LOG(LogDreamNiagara, Display,
+						TEXT("Auto-adding post-dependency '%s' via module '%s' after '%s'."),
+						*PendingDependency.Dependency.Id.ToString(),
+						*GetPathNameSafe(Provider.Module.Script),
+						*PendingDependency.SourceModuleName);
+					if (!AddResolvedModuleWithDependencies(Context, System, Emitter, State, Provider.Module, Provider.StackUsage, nullptr, Provider.Module.Script->GetName(), OutError))
+					{
+						State.ResolvingDependencies.Remove(DependencyKey);
+						return false;
+					}
+				}
+				else if (!ResolveError.IsEmpty())
+				{
+					Context.AddWarning(FString::Printf(
+						TEXT("Could not auto-add post-dependency '%s' for module '%s': %s"),
+						*PendingDependency.Dependency.Id.ToString(),
+						*PendingDependency.SourceModuleName,
+						*ResolveError));
+				}
+				State.ResolvingDependencies.Remove(DependencyKey);
+			}
+
+			return true;
 		}
 
 		void ConfigureEmitterSimTarget(UNiagaraEmitter& Emitter, const EDreamNiagaraSimTarget SimTarget)
@@ -584,6 +959,7 @@ namespace UE::DreamNiagara::SystemEditor
 			const FDreamNiagaraEmitter& EmitterDefinition,
 			FString& OutError)
 		{
+			FStackBuildState State;
 			for (const FDreamNiagaraStack& Stack : EmitterDefinition.Stacks)
 			{
 				const Private::EDreamNiagaraStackUsage StackUsage = Private::ParseStackUsage(Stack.Name);
@@ -605,41 +981,6 @@ namespace UE::DreamNiagara::SystemEditor
 					continue;
 				}
 
-				UNiagaraNodeOutput* OutputNode = FindOutputNodeForStack(Emitter, StackUsage);
-				if (!OutputNode)
-				{
-					OutError = FString::Printf(TEXT("Could not find Niagara output node for stack '%s' in emitter '%s'."), *Stack.Name, *EmitterDefinition.Name);
-					return false;
-				}
-
-				FVersionedNiagaraEmitterData* EmitterData = Emitter.GetLatestEmitterData();
-				UNiagaraScript* TargetScript = nullptr;
-				if (EmitterData)
-				{
-					switch (StackUsage)
-					{
-					case Private::EDreamNiagaraStackUsage::EmitterSpawn:
-						TargetScript = EmitterData->EmitterSpawnScriptProps.Script;
-						break;
-					case Private::EDreamNiagaraStackUsage::EmitterUpdate:
-						TargetScript = EmitterData->EmitterUpdateScriptProps.Script;
-						break;
-					case Private::EDreamNiagaraStackUsage::ParticleSpawn:
-						TargetScript = EmitterData->SpawnScriptProps.Script;
-						break;
-					case Private::EDreamNiagaraStackUsage::ParticleUpdate:
-						TargetScript = EmitterData->UpdateScriptProps.Script;
-						break;
-					default:
-						break;
-					}
-				}
-				if (!TargetScript)
-				{
-					OutError = FString::Printf(TEXT("Could not resolve target Niagara script for stack '%s' in emitter '%s'."), *Stack.Name, *EmitterDefinition.Name);
-					return false;
-				}
-
 				for (const FDreamNiagaraModuleCall& ModuleCall : Stack.Modules)
 				{
 					Private::FResolvedModule ResolvedModule;
@@ -654,29 +995,25 @@ namespace UE::DreamNiagara::SystemEditor
 						continue;
 					}
 
-					UNiagaraNodeFunctionCall* ModuleNode = FNiagaraStackGraphUtilities::AddScriptModuleToStack(
-						ResolvedModule.Script,
-						*OutputNode);
-					if (!ModuleNode)
-					{
-						Context.AddWarning(FString::Printf(
-							TEXT("Failed to add module '%s' to stack '%s' in emitter '%s'."),
-							*ModuleCall.ModuleId,
-							*Stack.Name,
-							*EmitterDefinition.Name));
-						continue;
-					}
-
-					const FVersionedNiagaraEmitter VersionedEmitter(&Emitter, Emitter.GetExposedVersion().VersionGuid);
-					Private::FModuleInputApplier::ApplyInputs(
+					if (!AddResolvedModuleWithDependencies(
 						Context,
-						Emitter.GetUniqueEmitterName(),
 						System,
-						VersionedEmitter,
-						*TargetScript,
-						*ModuleNode,
-						ModuleCall.Inputs);
+						Emitter,
+						State,
+						ResolvedModule,
+						StackUsage,
+						&ModuleCall.Inputs,
+						ModuleCall.ModuleId,
+						OutError))
+					{
+						return false;
+					}
 				}
+			}
+
+			if (!ResolvePendingPostDependencies(Context, System, Emitter, State, OutError))
+			{
+				return false;
 			}
 
 			if (FVersionedNiagaraEmitterData* EmitterData = Emitter.GetLatestEmitterData())

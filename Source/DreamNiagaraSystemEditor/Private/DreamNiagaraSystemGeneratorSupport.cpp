@@ -171,6 +171,28 @@ namespace UE::DreamNiagara::SystemEditor::Private
 		}
 	}
 
+	static bool TryStripKnownInternalRoot(FString& InOutAlias)
+	{
+		TArray<FString> Segments;
+		InOutAlias.ParseIntoArray(Segments, TEXT("."), true);
+		if (Segments.Num() <= 1)
+		{
+			return false;
+		}
+
+		const FString& RootSegment = Segments[0];
+		if (!RootSegment.Equals(TEXT("Emitter"), ESearchCase::IgnoreCase)
+			&& !RootSegment.Equals(TEXT("System"), ESearchCase::IgnoreCase)
+			&& !RootSegment.Equals(TEXT("Solvers"), ESearchCase::IgnoreCase))
+		{
+			return false;
+		}
+
+		Segments.RemoveAt(0, 1, EAllowShrinking::No);
+		InOutAlias = FString::Join(Segments, TEXT("."));
+		return true;
+	}
+
 	static FString NormalizeModuleId(FString ModuleId)
 	{
 		ModuleId.TrimStartAndEndInline();
@@ -209,6 +231,57 @@ namespace UE::DreamNiagara::SystemEditor::Private
 			true);
 	}
 
+	static UNiagaraScript* ResolveDeprecationRecommendation(UNiagaraScript* Script)
+	{
+		TSet<UNiagaraScript*> VisitedScripts;
+		while (Script && !VisitedScripts.Contains(Script))
+		{
+			VisitedScripts.Add(Script);
+			FVersionedNiagaraScriptData* ScriptData = Script->GetLatestScriptData();
+			if (!ScriptData || !ScriptData->bDeprecated || !ScriptData->DeprecationRecommendation)
+			{
+				return Script;
+			}
+			Script = ScriptData->DeprecationRecommendation;
+		}
+
+		return nullptr;
+	}
+
+	static bool IsDeprecatedModuleScript(const UNiagaraScript* Script)
+	{
+		const FVersionedNiagaraScriptData* ScriptData = Script ? Script->GetLatestScriptData() : nullptr;
+		return ScriptData && ScriptData->bDeprecated;
+	}
+
+	static int32 GetAliasMatchScore(const FAssetData& AssetData, const FString& AliasSuffix)
+	{
+		FString AliasPath = AliasSuffix;
+		TryStripKnownInternalRoot(AliasPath);
+		AliasPath.ReplaceInline(TEXT("."), TEXT("/"));
+
+		const FString ObjectPath = AssetData.GetObjectPathString();
+		const FString AssetName = AssetData.AssetName.ToString();
+		const FString AliasLeafName = FPackageName::GetShortName(AliasPath);
+
+		int32 Score = 0;
+		if (ObjectPath.Contains(TEXT("/V2/"), ESearchCase::IgnoreCase)
+			|| ObjectPath.Contains(TEXT("/V3/"), ESearchCase::IgnoreCase))
+		{
+			Score -= 80;
+		}
+		if (ObjectPath.EndsWith(TEXT("/") + AliasPath + TEXT(".") + AssetName, ESearchCase::IgnoreCase))
+		{
+			Score -= 40;
+		}
+		if (AssetName.Equals(AliasLeafName, ESearchCase::IgnoreCase))
+		{
+			Score -= 20;
+		}
+		Score += ObjectPath.Len();
+		return Score;
+	}
+
 	static bool TryResolveDirectModulePath(
 		const FString& ModuleId,
 		EDreamNiagaraStackUsage StackUsage,
@@ -225,6 +298,13 @@ namespace UE::DreamNiagara::SystemEditor::Private
 		if (!Script)
 		{
 			OutError = FString::Printf(TEXT("Could not load Niagara module asset '%s'."), *ObjectPath);
+			return true;
+		}
+
+		Script = ResolveDeprecationRecommendation(Script);
+		if (!Script)
+		{
+			OutError = FString::Printf(TEXT("Niagara module asset '%s' is deprecated and has no usable replacement."), *ObjectPath);
 			return true;
 		}
 
@@ -256,12 +336,15 @@ namespace UE::DreamNiagara::SystemEditor::Private
 
 		const FString UsageSegment = ToInternalUsageSegment(StackUsage);
 		const FString ExpectedPathFragment = TEXT("/Modules/") + UsageSegment + TEXT("/");
-		if (!UsageSegment.IsEmpty() && !NormalizedObjectPath.Contains(ExpectedPathFragment, ESearchCase::IgnoreCase))
+		FString AliasPath = AliasSuffix;
+		const bool bUsesKnownInternalRoot = TryStripKnownInternalRoot(AliasPath);
+		if (!bUsesKnownInternalRoot
+			&& !UsageSegment.IsEmpty()
+			&& !NormalizedObjectPath.Contains(ExpectedPathFragment, ESearchCase::IgnoreCase))
 		{
 			return false;
 		}
 
-		FString AliasPath = AliasSuffix;
 		AliasPath.ReplaceInline(TEXT("."), TEXT("/"));
 		const FString AssetName = AssetData.AssetName.ToString();
 		const FString AliasLeafName = FPackageName::GetShortName(AliasPath);
@@ -308,7 +391,11 @@ namespace UE::DreamNiagara::SystemEditor::Private
 		for (const FAssetData& AssetData : ScriptAssets)
 		{
 			UNiagaraScript* Script = Cast<UNiagaraScript>(AssetData.GetAsset());
-			if (!Script || Script->GetUsage() != ENiagaraScriptUsage::Module || !IsSupportedModuleUsage(Script, StackUsage))
+			Script = ResolveDeprecationRecommendation(Script);
+			if (!Script
+				|| Script->GetUsage() != ENiagaraScriptUsage::Module
+				|| IsDeprecatedModuleScript(Script)
+				|| !IsSupportedModuleUsage(Script, StackUsage))
 			{
 				continue;
 			}
@@ -327,17 +414,172 @@ namespace UE::DreamNiagara::SystemEditor::Private
 
 		Matches.Sort([](const FAssetData& Left, const FAssetData& Right)
 		{
-			return Left.GetObjectPathString().Len() < Right.GetObjectPathString().Len();
+			return Left.GetObjectPathString() < Right.GetObjectPathString();
+		});
+		Matches.Sort([&Alias](const FAssetData& Left, const FAssetData& Right)
+		{
+			return GetAliasMatchScore(Left, Alias) < GetAliasMatchScore(Right, Alias);
 		});
 
-		OutModule.AssetData = Matches[0];
-		OutModule.Script = Cast<UNiagaraScript>(Matches[0].GetAsset());
+		UNiagaraScript* MatchedScript = Cast<UNiagaraScript>(Matches[0].GetAsset());
+		MatchedScript = ResolveDeprecationRecommendation(MatchedScript);
+		OutModule.Script = MatchedScript;
+		OutModule.AssetData = MatchedScript ? FAssetData(MatchedScript) : Matches[0];
 		if (!OutModule.Script)
 		{
 			OutError = FString::Printf(TEXT("Resolved module '%s' but failed to load it."), *Matches[0].GetObjectPathString());
 			return false;
 		}
 
+		return true;
+	}
+
+	static bool IsDependencyEvaluatedInUsage(const FNiagaraModuleDependency& Dependency, const EDreamNiagaraStackUsage StackUsage)
+	{
+		ENiagaraModuleDependencyUsage DependencyUsage = ENiagaraModuleDependencyUsage::None;
+		switch (StackUsage)
+		{
+		case EDreamNiagaraStackUsage::EmitterSpawn:
+		case EDreamNiagaraStackUsage::ParticleSpawn:
+		case EDreamNiagaraStackUsage::SystemSpawn:
+			DependencyUsage = ENiagaraModuleDependencyUsage::Spawn;
+			break;
+		case EDreamNiagaraStackUsage::EmitterUpdate:
+		case EDreamNiagaraStackUsage::ParticleUpdate:
+		case EDreamNiagaraStackUsage::SystemUpdate:
+			DependencyUsage = ENiagaraModuleDependencyUsage::Update;
+			break;
+		case EDreamNiagaraStackUsage::ParticleEvent:
+			DependencyUsage = ENiagaraModuleDependencyUsage::Event;
+			break;
+		case EDreamNiagaraStackUsage::SimulationStage:
+			DependencyUsage = ENiagaraModuleDependencyUsage::SimulationStage;
+			break;
+		default:
+			return false;
+		}
+
+		return (Dependency.OnlyEvaluateInScriptUsage & (1 << static_cast<int32>(DependencyUsage))) != 0;
+	}
+
+	static bool ScriptProvidesDependency(
+		const UNiagaraScript* Script,
+		const FNiagaraModuleDependency& Dependency,
+		const EDreamNiagaraStackUsage StackUsage)
+	{
+		const FVersionedNiagaraScriptData* ScriptData = Script ? Script->GetLatestScriptData() : nullptr;
+		return ScriptData
+			&& ScriptData->ProvidedDependencies.Contains(Dependency.Id)
+			&& Dependency.IsVersionAllowed(ScriptData->Version)
+			&& IsSupportedModuleUsage(Script, StackUsage);
+	}
+
+	static int32 GetDependencyProviderScore(const FAssetData& AssetData)
+	{
+		const FString ObjectPath = AssetData.GetObjectPathString();
+		int32 Score = ObjectPath.Len();
+		if (ObjectPath.Contains(TEXT("/Solvers/"), ESearchCase::IgnoreCase))
+		{
+			Score -= 60;
+		}
+		if (ObjectPath.Contains(TEXT("/V2/"), ESearchCase::IgnoreCase)
+			|| ObjectPath.Contains(TEXT("/V3/"), ESearchCase::IgnoreCase))
+		{
+			Score -= 40;
+		}
+		return Score;
+	}
+
+	bool ResolveDependencyProvider(
+		const FNiagaraModuleDependency& Dependency,
+		const EDreamNiagaraStackUsage SourceStackUsage,
+		FResolvedDependencyProvider& OutProvider,
+		FString& OutError)
+	{
+		if (Dependency.Id.IsNone())
+		{
+			OutError = TEXT("Dependency id cannot be empty.");
+			return false;
+		}
+
+		if (!IsDependencyEvaluatedInUsage(Dependency, SourceStackUsage))
+		{
+			OutError.Reset();
+			return false;
+		}
+
+		TArray<EDreamNiagaraStackUsage> CandidateUsages;
+		CandidateUsages.Add(SourceStackUsage);
+		if (Dependency.ScriptConstraint == ENiagaraModuleDependencyScriptConstraint::AllScripts)
+		{
+			if (SourceStackUsage == EDreamNiagaraStackUsage::ParticleUpdate)
+			{
+				CandidateUsages.Add(EDreamNiagaraStackUsage::ParticleSpawn);
+			}
+			else if (SourceStackUsage == EDreamNiagaraStackUsage::ParticleSpawn)
+			{
+				CandidateUsages.Add(EDreamNiagaraStackUsage::ParticleUpdate);
+			}
+		}
+
+		FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+		if (!AssetRegistryModule.Get().IsSearchAllAssets())
+		{
+			AssetRegistryModule.Get().ScanPathsSynchronous({ TEXT("/Niagara"), TEXT("/Game") }, true);
+		}
+
+		TArray<FAssetData> ScriptAssets;
+		AssetRegistryModule.Get().GetAssetsByClass(UNiagaraScript::StaticClass()->GetClassPathName(), ScriptAssets, true);
+
+		struct FCandidate
+		{
+			FAssetData AssetData;
+			UNiagaraScript* Script = nullptr;
+			EDreamNiagaraStackUsage StackUsage = EDreamNiagaraStackUsage::Unknown;
+		};
+
+		TArray<FCandidate> Candidates;
+		for (const FAssetData& AssetData : ScriptAssets)
+		{
+			UNiagaraScript* Script = Cast<UNiagaraScript>(AssetData.GetAsset());
+			Script = ResolveDeprecationRecommendation(Script);
+			if (!Script || Script->GetUsage() != ENiagaraScriptUsage::Module || IsDeprecatedModuleScript(Script))
+			{
+				continue;
+			}
+
+			for (const EDreamNiagaraStackUsage CandidateUsage : CandidateUsages)
+			{
+				if (ScriptProvidesDependency(Script, Dependency, CandidateUsage))
+				{
+					FCandidate Candidate;
+					Candidate.AssetData = FAssetData(Script);
+					Candidate.Script = Script;
+					Candidate.StackUsage = CandidateUsage;
+					Candidates.Add(Candidate);
+					break;
+				}
+			}
+		}
+
+		if (Candidates.IsEmpty())
+		{
+			OutError = FString::Printf(TEXT("Could not find module providing dependency '%s'."), *Dependency.Id.ToString());
+			return false;
+		}
+
+		Candidates.Sort([](const FCandidate& Left, const FCandidate& Right)
+		{
+			return Left.AssetData.GetObjectPathString() < Right.AssetData.GetObjectPathString();
+		});
+		Candidates.Sort([](const FCandidate& Left, const FCandidate& Right)
+		{
+			return GetDependencyProviderScore(Left.AssetData) < GetDependencyProviderScore(Right.AssetData);
+		});
+
+		OutProvider.Module.AssetData = Candidates[0].AssetData;
+		OutProvider.Module.Script = Candidates[0].Script;
+		OutProvider.StackUsage = Candidates[0].StackUsage;
 		return true;
 	}
 }

@@ -41,6 +41,12 @@ namespace UE::DreamNiagara::SystemEditor::Private
 		UNiagaraScript* Script = nullptr;
 	};
 
+	struct FResolvedDependencyProvider
+	{
+		FResolvedModule Module;
+		EDreamNiagaraStackUsage StackUsage = EDreamNiagaraStackUsage::Unknown;
+	};
+
 	bool ResolveAssetDestination(
 		const UE::DreamNiagara::FDreamNiagaraSystem& Definition,
 		FString& OutPackageName,
@@ -56,5 +62,11 @@ namespace UE::DreamNiagara::SystemEditor::Private
 		const FString& ModuleId,
 		EDreamNiagaraStackUsage StackUsage,
 		FResolvedModule& OutModule,
+		FString& OutError);
+
+	bool ResolveDependencyProvider(
+		const FNiagaraModuleDependency& Dependency,
+		EDreamNiagaraStackUsage SourceStackUsage,
+		FResolvedDependencyProvider& OutProvider,
 		FString& OutError);
 }
