@@ -1,0 +1,42 @@
+{
+	"FileVersion": 3,
+	"Version": 10,
+	"VersionName": "0.1.0",
+	"FriendlyName": "DreamNiagara",
+	"Description": "Author Niagara systems with DreamNiagara .dns source files that auto-generate standard UNiagaraSystem assets.",
+	"Category": "DreamPlugin",
+	"CreatedBy": "TypeDreamMoon",
+	"CreatedByURL": "https://github.com/TypeDreamMoon",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "https://github.com/TypeDreamMoon",
+	"Copyright": "Copyright (c) 2026 TypeDreamMoon. All rights reserved.",
+	"EnabledByDefault": true,
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "DreamNiagara",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "DreamNiagaraSystemEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "DreamNiagaraEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "Niagara",
+			"Enabled": true
+		}
+	],
+	"IsExperimentalVersion": false
+}
