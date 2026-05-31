@@ -9,6 +9,7 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "FileHelpers.h"
 #include "HAL/FileManager.h"
+#include "Misc/Crc.h"
 #include "Misc/FileHelper.h"
 #include "NiagaraEmitter.h"
 #include "NiagaraEmitterFactoryNew.h"
@@ -25,9 +26,12 @@
 #include "NiagaraSystem.h"
 #include "NiagaraSystemFactoryNew.h"
 #include "NiagaraUserRedirectionParameterStore.h"
+#include "NiagaraDataInterface.h"
+#include "NiagaraDataInterfaceCurveBase.h"
 #include "Materials/MaterialInterface.h"
 #include "Misc/PackageName.h"
 #include "UObject/Package.h"
+#include "UObject/MetaData.h"
 #include "UObject/UObjectGlobals.h"
 #include "ViewModels/Stack/NiagaraStackGraphUtilities.h"
 
@@ -818,6 +822,10 @@ namespace UE::DreamNiagara::SystemEditor
 				OutType = FNiagaraTypeDefinition::GetColorDef();
 				return true;
 			}
+			if (Private::FLiteralParser::ResolveCurveType(TypeText, OutType))
+			{
+				return true;
+			}
 
 			return false;
 		}
@@ -842,6 +850,57 @@ namespace UE::DreamNiagara::SystemEditor
 
 			const FString Text = Parameter.DefaultValue.Text.TrimStartAndEnd();
 			const FNiagaraTypeDefinition& Type = Variable.GetType();
+
+			if (Private::FLiteralParser::IsCurveDataInterfaceType(Type))
+			{
+				Private::FCurveLiteral CurveLiteral;
+				FString CurveError;
+				if (!Private::FLiteralParser::TryParseCurve(Parameter.DefaultValue, CurveLiteral, CurveError))
+				{
+					Context.AddWarning(FString::Printf(
+						TEXT("Default value '%s' for curve user parameter '%s' could not be parsed: %s"),
+						*Text,
+						*Parameter.Name,
+						CurveError.IsEmpty() ? TEXT("expected curve { ... } literal") : *CurveError));
+					return false;
+				}
+
+				if (!Type.GetClass() || !Type.GetClass()->IsChildOf(Private::FLiteralParser::GetCurveClass(CurveLiteral.Kind)))
+				{
+					Context.AddWarning(FString::Printf(
+						TEXT("Default value for user parameter '%s' is a curve literal with the wrong channel type for '%s'."),
+						*Parameter.Name,
+						*Parameter.Type));
+					return false;
+				}
+
+				UNiagaraDataInterfaceCurveBase* CurveDataInterface = Cast<UNiagaraDataInterfaceCurveBase>(Store.GetDataInterface(Variable));
+				if (!CurveDataInterface || CurveDataInterface->GetClass() != Type.GetClass())
+				{
+					UObject* DataInterfaceOwner = Store.GetOwner() ? Store.GetOwner() : GetTransientPackage();
+					const EObjectFlags DataInterfaceObjectFlags = UNiagaraDataInterface::BuildObjectFlagsForOwner(DataInterfaceOwner, RF_Transactional);
+					CurveDataInterface = Cast<UNiagaraDataInterfaceCurveBase>(
+						NewObject<UNiagaraDataInterface>(DataInterfaceOwner, Type.GetClass(), NAME_None, DataInterfaceObjectFlags));
+				}
+
+				if (!CurveDataInterface)
+				{
+					Context.AddWarning(FString::Printf(TEXT("Could not create curve data interface for user parameter '%s'."), *Parameter.Name));
+					return false;
+				}
+
+				if (!Private::FLiteralParser::ApplyCurveToDataInterface(CurveLiteral, *CurveDataInterface, CurveError))
+				{
+					Context.AddWarning(FString::Printf(
+						TEXT("Default value for user parameter '%s' could not be applied: %s"),
+						*Parameter.Name,
+						*CurveError));
+					return false;
+				}
+
+				Store.SetDataInterface(CurveDataInterface, Variable);
+				return true;
+			}
 
 			bool BoolValue = false;
 			if (Type == FNiagaraTypeDefinition::GetBoolDef() && Private::FLiteralParser::ParseBool(Text, BoolValue))
@@ -1114,6 +1173,210 @@ namespace UE::DreamNiagara::SystemEditor
 			System.MarkPackageDirty();
 			return true;
 		}
+
+		FString BuildSourceHash(const FString& SourceText)
+		{
+			return FString::Printf(TEXT("%08x"), FCrc::StrCrc32(*SourceText));
+		}
+
+		FString GetSourceMetadataValue(UObject* Asset, const TCHAR* Key)
+		{
+			if (!Asset)
+			{
+				return FString();
+			}
+
+			UPackage* Package = Asset->GetOutermost();
+			if (!Package)
+			{
+				return FString();
+			}
+
+			return Package->GetMetaData().GetValue(Asset, Key);
+		}
+
+		bool IsGeneratedAssetSourceCurrent(UObject* Asset, const FString& SourceFilePath, const FString& SourceHash)
+		{
+			if (!Asset || SourceHash.IsEmpty())
+			{
+				return false;
+			}
+
+			const FString ExistingSourceFileRaw = GetSourceMetadataValue(Asset, TEXT("DreamNiagara.SourceFile"));
+			if (ExistingSourceFileRaw.IsEmpty())
+			{
+				return false;
+			}
+
+			const FString ExistingSourceFile = UE::DreamNiagara::NormalizeSourceFilePath(ExistingSourceFileRaw);
+			const FString ExistingSourceHash = GetSourceMetadataValue(Asset, TEXT("DreamNiagara.SourceHash"));
+
+			return ExistingSourceFile.Equals(UE::DreamNiagara::NormalizeSourceFilePath(SourceFilePath), ESearchCase::IgnoreCase)
+				&& ExistingSourceHash.Equals(SourceHash, ESearchCase::CaseSensitive);
+		}
+
+		void ApplySourceMetadata(UObject* Asset, const FString& SourceFilePath, const FString& SourceHash)
+		{
+			if (!Asset)
+			{
+				return;
+			}
+
+			UPackage* Package = Asset->GetOutermost();
+			if (!Package)
+			{
+				return;
+			}
+
+			FMetaData& MetaData = Package->GetMetaData();
+			MetaData.SetValue(Asset, TEXT("DreamNiagara.SourceFile"), *UE::DreamNiagara::NormalizeSourceFilePath(SourceFilePath));
+			if (!SourceHash.IsEmpty())
+			{
+				MetaData.SetValue(Asset, TEXT("DreamNiagara.SourceHash"), *SourceHash);
+				MetaData.SetValue(Asset, TEXT("DreamNiagara.GeneratedAtUtc"), *FDateTime::UtcNow().ToIso8601());
+			}
+		}
+
+		FDreamNiagaraSystemGenerateResult GenerateFromDefinitionInternal(
+			const FDreamNiagaraSystem& Definition,
+			const FString& SourceFilePath,
+			const FString& SourceHash,
+			const bool bForce)
+		{
+			FDreamNiagaraSystemGenerateResult Result;
+
+			Private::FGenerationContext Context;
+			Context.Definition = &Definition;
+			Context.SourceFilePath = SourceFilePath;
+
+			FString PackageName;
+			FString AssetName;
+			FString ObjectPath;
+			FString Error;
+			if (!Private::ResolveAssetDestination(Definition, PackageName, AssetName, ObjectPath, Error))
+			{
+				Result.Message = Error;
+				return Result;
+			}
+
+			UObject* ExistingObject = StaticFindObject(UObject::StaticClass(), nullptr, *ObjectPath);
+			if (!ExistingObject)
+			{
+				ExistingObject = StaticLoadObject(UObject::StaticClass(), nullptr, *ObjectPath);
+			}
+
+			UPackage* Package = ExistingObject ? ExistingObject->GetOutermost() : CreatePackage(*PackageName);
+			if (!Package)
+			{
+				Result.Message = FString::Printf(TEXT("Failed to create package '%s'."), *PackageName);
+				return Result;
+			}
+
+			if (ExistingObject && !ExistingObject->IsA<UNiagaraSystem>())
+			{
+				Result.Message = FString::Printf(
+					TEXT("Cannot generate Niagara system '%s' because the target asset name is already used by '%s'."),
+					*ObjectPath,
+					*ExistingObject->GetClass()->GetName());
+				return Result;
+			}
+
+			UNiagaraSystem* System = Cast<UNiagaraSystem>(ExistingObject);
+			if (!bForce && IsGeneratedAssetSourceCurrent(System, SourceFilePath, SourceHash))
+			{
+				Result.bSucceeded = true;
+				Result.Message = FString::Printf(TEXT("Skipped Niagara system '%s' from '%s'; source hash is unchanged."), *ObjectPath, *SourceFilePath);
+				UE_LOG(LogDreamNiagara, Verbose, TEXT("%s"), *Result.Message);
+				return Result;
+			}
+
+			const bool bCreatedAsset = System == nullptr;
+			if (!System)
+			{
+				System = NewObject<UNiagaraSystem>(Package, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
+			}
+
+			if (!System)
+			{
+				Result.Message = FString::Printf(TEXT("Failed to create Niagara system asset '%s'."), *ObjectPath);
+				return Result;
+			}
+
+			if (!GenerateIntoSystem(Context, *System, bForce, Error))
+			{
+				Result.Message = FString::Printf(TEXT("Failed to generate Niagara system '%s': %s"), *ObjectPath, *Error);
+				Result.Warnings = MoveTemp(Context.Warnings);
+				return Result;
+			}
+
+			if (bCreatedAsset)
+			{
+				FAssetRegistryModule::AssetCreated(System);
+			}
+
+			ApplySourceMetadata(System, SourceFilePath, SourceHash);
+
+			TArray<UPackage*> PackagesToSave;
+			PackagesToSave.Add(Package);
+			if (!UEditorLoadingAndSavingUtils::SavePackages(PackagesToSave, true))
+			{
+				Result.Message = FString::Printf(TEXT("Generated '%s' but failed to save its package."), *ObjectPath);
+				Result.Warnings = MoveTemp(Context.Warnings);
+				return Result;
+			}
+
+			Result.bSucceeded = true;
+			Result.Warnings = MoveTemp(Context.Warnings);
+			Result.Message = FString::Printf(
+				TEXT("Generated Niagara system '%s' from '%s'%s."),
+				*ObjectPath,
+				*SourceFilePath,
+				bForce ? TEXT(" with force") : TEXT(""));
+			UE_LOG(LogDreamNiagara, Display, TEXT("%s"), *Result.Message);
+			return Result;
+		}
+	}
+
+	bool FSystemGenerator::IsGeneratedAssetCurrent(const FString& SourceFilePath)
+	{
+		const FString NormalizedSourceFilePath = UE::DreamNiagara::NormalizeSourceFilePath(SourceFilePath);
+		if (!UE::DreamNiagara::IsDreamNiagaraSystemFile(NormalizedSourceFilePath))
+		{
+			return true;
+		}
+
+		FString SourceText;
+		if (!FFileHelper::LoadFileToString(SourceText, *NormalizedSourceFilePath))
+		{
+			return false;
+		}
+
+		const FString SourceHash = BuildSourceHash(SourceText);
+
+		FDreamNiagaraSystem Definition;
+		FString ParseError;
+		if (!FDreamNiagaraParser::ParseSystem(SourceText, Definition, ParseError))
+		{
+			return false;
+		}
+
+		FString PackageName;
+		FString AssetName;
+		FString ObjectPath;
+		FString Error;
+		if (!Private::ResolveAssetDestination(Definition, PackageName, AssetName, ObjectPath, Error))
+		{
+			return false;
+		}
+
+		UObject* ExistingObject = StaticFindObject(UObject::StaticClass(), nullptr, *ObjectPath);
+		if (!ExistingObject)
+		{
+			ExistingObject = StaticLoadObject(UObject::StaticClass(), nullptr, *ObjectPath);
+		}
+
+		UNiagaraSystem* ExistingSystem = Cast<UNiagaraSystem>(ExistingObject);
+		return IsGeneratedAssetSourceCurrent(ExistingSystem, NormalizedSourceFilePath, SourceHash);
 	}
 
 	FDreamNiagaraSystemGenerateResult FSystemGenerator::GenerateFromFile(const FString& SourceFilePath, const bool bForce)
@@ -1134,6 +1397,8 @@ namespace UE::DreamNiagara::SystemEditor
 			return Result;
 		}
 
+		const FString SourceHash = BuildSourceHash(SourceText);
+
 		FDreamNiagaraSystem Definition;
 		FString ParseError;
 		if (!FDreamNiagaraParser::ParseSystem(SourceText, Definition, ParseError))
@@ -1142,7 +1407,8 @@ namespace UE::DreamNiagara::SystemEditor
 			return Result;
 		}
 
-		return GenerateFromDefinition(Definition, NormalizedSourceFilePath, bForce);
+		Result = GenerateFromDefinitionInternal(Definition, NormalizedSourceFilePath, SourceHash, bForce);
+		return Result;
 	}
 
 	FDreamNiagaraSystemGenerateResult FSystemGenerator::GenerateFromDefinition(
@@ -1150,86 +1416,12 @@ namespace UE::DreamNiagara::SystemEditor
 		const FString& SourceFilePath,
 		const bool bForce)
 	{
-		FDreamNiagaraSystemGenerateResult Result;
+		FString SourceText;
+		const FString NormalizedSourceFilePath = UE::DreamNiagara::NormalizeSourceFilePath(SourceFilePath);
+		const FString SourceHash = FFileHelper::LoadFileToString(SourceText, *NormalizedSourceFilePath)
+			? BuildSourceHash(SourceText)
+			: FString();
 
-		Private::FGenerationContext Context;
-		Context.Definition = &Definition;
-		Context.SourceFilePath = SourceFilePath;
-
-		FString PackageName;
-		FString AssetName;
-		FString ObjectPath;
-		FString Error;
-		if (!Private::ResolveAssetDestination(Definition, PackageName, AssetName, ObjectPath, Error))
-		{
-			Result.Message = Error;
-			return Result;
-		}
-
-		UObject* ExistingObject = StaticFindObject(UObject::StaticClass(), nullptr, *ObjectPath);
-		if (!ExistingObject)
-		{
-			ExistingObject = StaticLoadObject(UObject::StaticClass(), nullptr, *ObjectPath);
-		}
-
-		UPackage* Package = ExistingObject ? ExistingObject->GetOutermost() : CreatePackage(*PackageName);
-		if (!Package)
-		{
-			Result.Message = FString::Printf(TEXT("Failed to create package '%s'."), *PackageName);
-			return Result;
-		}
-
-		if (ExistingObject && !ExistingObject->IsA<UNiagaraSystem>())
-		{
-			Result.Message = FString::Printf(
-				TEXT("Cannot generate Niagara system '%s' because the target asset name is already used by '%s'."),
-				*ObjectPath,
-				*ExistingObject->GetClass()->GetName());
-			return Result;
-		}
-
-		UNiagaraSystem* System = Cast<UNiagaraSystem>(ExistingObject);
-		const bool bCreatedAsset = System == nullptr;
-		if (!System)
-		{
-			System = NewObject<UNiagaraSystem>(Package, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
-		}
-
-		if (!System)
-		{
-			Result.Message = FString::Printf(TEXT("Failed to create Niagara system asset '%s'."), *ObjectPath);
-			return Result;
-		}
-
-		if (!GenerateIntoSystem(Context, *System, bForce, Error))
-		{
-			Result.Message = FString::Printf(TEXT("Failed to generate Niagara system '%s': %s"), *ObjectPath, *Error);
-			Result.Warnings = MoveTemp(Context.Warnings);
-			return Result;
-		}
-
-		if (bCreatedAsset)
-		{
-			FAssetRegistryModule::AssetCreated(System);
-		}
-
-		TArray<UPackage*> PackagesToSave;
-		PackagesToSave.Add(Package);
-		if (!UEditorLoadingAndSavingUtils::SavePackages(PackagesToSave, true))
-		{
-			Result.Message = FString::Printf(TEXT("Generated '%s' but failed to save its package."), *ObjectPath);
-			Result.Warnings = MoveTemp(Context.Warnings);
-			return Result;
-		}
-
-		Result.bSucceeded = true;
-		Result.Warnings = MoveTemp(Context.Warnings);
-		Result.Message = FString::Printf(
-			TEXT("Generated Niagara system '%s' from '%s'%s."),
-			*ObjectPath,
-			*SourceFilePath,
-			bForce ? TEXT(" with force") : TEXT(""));
-		UE_LOG(LogDreamNiagara, Display, TEXT("%s"), *Result.Message);
-		return Result;
+		return GenerateFromDefinitionInternal(Definition, NormalizedSourceFilePath, SourceHash, bForce);
 	}
 }

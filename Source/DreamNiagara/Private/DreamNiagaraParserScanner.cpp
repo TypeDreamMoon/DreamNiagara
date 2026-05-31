@@ -384,18 +384,49 @@ namespace UE::DreamNiagara::Private
 			{
 				if (Char == TCHAR(';') || Char == TCHAR('\n') || Char == TCHAR('}'))
 				{
+					FString Prefix = Source.Mid(Start, Index - Start).TrimStartAndEnd();
+					if (!Prefix.IsEmpty())
+					{
+						const int32 SavedIndex = Index;
+						const int32 SavedLine = Line;
+						SkipIgnored();
+						if (Peek() == TCHAR('{'))
+						{
+							FString Block;
+							if (!ExtractBalancedBlock(Block, OutError))
+							{
+								return false;
+							}
+							OutValue.Kind = EDreamNiagaraValueKind::Block;
+							OutValue.Text = FString::Printf(TEXT("%s {%s}"), *Prefix, *Block);
+							SkipIgnored();
+							TryConsume(TCHAR(';'));
+							return true;
+						}
+						Index = SavedIndex;
+						Line = SavedLine;
+					}
 					break;
 				}
 				if (Char == TCHAR('{'))
 				{
-					Index = Start;
+					const FString Prefix = Source.Mid(Start, Index - Start).TrimStartAndEnd();
 					FString Block;
 					if (!ExtractBalancedBlock(Block, OutError))
 					{
 						return false;
 					}
 					OutValue.Kind = EDreamNiagaraValueKind::Block;
-					OutValue.Text = Block.TrimStartAndEnd();
+					if (Prefix.IsEmpty())
+					{
+						OutValue.Text = Block.TrimStartAndEnd();
+					}
+					else
+					{
+						OutValue.Text = FString::Printf(TEXT("%s {%s}"), *Prefix, *Block);
+					}
+					SkipIgnored();
+					TryConsume(TCHAR(';'));
 					return true;
 				}
 			}

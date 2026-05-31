@@ -53,53 +53,47 @@ namespace UE::DreamNiagara
 			TArray<FDreamNiagaraUserParameter>& OutParameters,
 			FString& OutError)
 		{
-			for (const FString& Statement : Private::SplitTopLevelStatements(Block))
+			Private::FDnsScanner Scanner(Block);
+			while (true)
 			{
-				FString Declaration = Statement.TrimStartAndEnd();
-				if (Declaration.IsEmpty())
+				Scanner.SkipIgnored();
+				if (Scanner.IsAtEnd())
 				{
-					continue;
-				}
-
-				FString Left = Declaration;
-				FString Right;
-				const bool bHasDefault = Private::SplitTopLevelAssignment(Declaration, Left, Right);
-
-				FString Name;
-				FString Type;
-				if (!Left.Split(TEXT(":"), &Name, &Type))
-				{
-					OutError = FString::Printf(TEXT("Invalid user parameter declaration '%s'. Expected Name: type."), *Statement);
-					return false;
-				}
-
-				Name.TrimStartAndEndInline();
-				Type.TrimStartAndEndInline();
-				if (Name.IsEmpty() || Type.IsEmpty())
-				{
-					OutError = FString::Printf(TEXT("Invalid user parameter declaration '%s'."), *Statement);
-					return false;
+					return true;
 				}
 
 				FDreamNiagaraUserParameter Parameter;
-				Parameter.Name = MoveTemp(Name);
-				Parameter.Type = MoveTemp(Type);
-				Parameter.bHasDefaultValue = bHasDefault;
-				if (bHasDefault)
+				Parameter.Line = Scanner.Line;
+				if (!Scanner.ParseDottedIdentifier(Parameter.Name, OutError))
 				{
-					Parameter.DefaultValue.Kind = EDreamNiagaraValueKind::Expression;
-					Parameter.DefaultValue.Text = Right.TrimStartAndEnd();
-					if (Parameter.DefaultValue.Text.IsEmpty())
+					return false;
+				}
+
+				if (!Scanner.Expect(TCHAR(':'), OutError))
+				{
+					return false;
+				}
+
+				if (!Scanner.ParseIdentifier(Parameter.Type, OutError))
+				{
+					return false;
+				}
+
+				if (Scanner.TryConsume(TCHAR('=')))
+				{
+					Parameter.bHasDefaultValue = true;
+					if (!Scanner.ParseAssignmentValue(Parameter.DefaultValue, OutError))
 					{
-						OutError = FString::Printf(TEXT("Default value for user parameter '%s' cannot be empty."), *Parameter.Name);
 						return false;
 					}
+				}
+				else
+				{
+					Scanner.TryConsume(TCHAR(';'));
 				}
 
 				OutParameters.Add(MoveTemp(Parameter));
 			}
-
-			return true;
 		}
 
 		bool ParseStackBody(const FString& Block, FDreamNiagaraStack& OutStack, FString& OutError)

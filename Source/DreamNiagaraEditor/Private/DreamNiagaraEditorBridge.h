@@ -15,7 +15,7 @@ namespace UE::DreamNiagara::Editor::Private
 
 	private:
 		void QueueFullScan();
-		void QueueSourceFile(const FString& SourceFilePath);
+		void QueueSourceFile(const FString& SourceFilePath, bool bOnlyIfStale);
 		void OnDirectoryChanged(const TArray<FFileChangeData>& FileChanges);
 		bool Tick(float DeltaSeconds);
 		void ProcessReadyFiles();

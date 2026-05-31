@@ -94,14 +94,19 @@ namespace UE::DreamNiagara::Editor::Private
 		IFileManager::Get().FindFilesRecursive(SourceFiles, *WatchedSourceDirectory, TEXT("*.dns"), true, false);
 		for (const FString& SourceFile : SourceFiles)
 		{
-			QueueSourceFile(SourceFile);
+			QueueSourceFile(SourceFile, true);
 		}
 	}
 
-	void FDreamNiagaraEditorBridge::QueueSourceFile(const FString& SourceFilePath)
+	void FDreamNiagaraEditorBridge::QueueSourceFile(const FString& SourceFilePath, const bool bOnlyIfStale)
 	{
 		const FString NormalizedPath = ResolveChangedFilePath(WatchedSourceDirectory, SourceFilePath);
 		if (!UE::DreamNiagara::IsDreamNiagaraSystemFile(NormalizedPath))
+		{
+			return;
+		}
+
+		if (bOnlyIfStale && UE::DreamNiagara::SystemEditor::FSystemGenerator::IsGeneratedAssetCurrent(NormalizedPath))
 		{
 			return;
 		}
@@ -113,7 +118,7 @@ namespace UE::DreamNiagara::Editor::Private
 	{
 		for (const FFileChangeData& Change : FileChanges)
 		{
-			QueueSourceFile(Change.Filename);
+			QueueSourceFile(Change.Filename, true);
 		}
 	}
 

@@ -5,6 +5,8 @@
 
 #include "EdGraph/EdGraphPin.h"
 #include "NiagaraCommon.h"
+#include "NiagaraDataInterface.h"
+#include "NiagaraDataInterfaceCurveBase.h"
 #include "NiagaraNodeFunctionCall.h"
 #include "NiagaraParameterMapHistory.h"
 #include "NiagaraScript.h"
@@ -265,6 +267,85 @@ namespace UE::DreamNiagara::SystemEditor::Private
 
 			return false;
 		}
+
+		bool ApplyCurveLiteral(
+			FGenerationContext& Context,
+			const FNiagaraTypeDefinition& InputType,
+			UNiagaraNodeFunctionCall& ModuleNode,
+			const FDreamNiagaraAssignment& Input)
+		{
+			if (!FLiteralParser::IsCurveDataInterfaceType(InputType))
+			{
+				return false;
+			}
+
+			FCurveLiteral CurveLiteral;
+			FString CurveError;
+			if (!FLiteralParser::TryParseCurve(Input.Value, CurveLiteral, CurveError))
+			{
+				Context.AddWarning(FString::Printf(
+					TEXT("Module '%s' input '%s' expects a Niagara curve data interface, but value '%s' is not a valid inline curve literal%s%s."),
+					*ModuleNode.GetFunctionName(),
+					*Input.Name,
+					*Input.Value.Text,
+					CurveError.IsEmpty() ? TEXT("") : TEXT(": "),
+					CurveError.IsEmpty() ? TEXT("") : *CurveError));
+				return true;
+			}
+
+			if (!InputType.GetClass() || !InputType.GetClass()->IsChildOf(FLiteralParser::GetCurveClass(CurveLiteral.Kind)))
+			{
+				Context.AddWarning(FString::Printf(
+					TEXT("Module '%s' input '%s' expects curve data interface class '%s', but value '%s' uses the wrong curve channel type."),
+					*ModuleNode.GetFunctionName(),
+					*Input.Name,
+					*InputType.GetName(),
+					*Input.Value.Text));
+				return true;
+			}
+
+			UEdGraphPin& OverridePin = FNiagaraStackGraphUtilities::GetOrCreateStackFunctionInputOverridePin(
+				ModuleNode,
+				MakeAliasedInputHandle(ModuleNode, FName(*Input.Name)),
+				InputType,
+				FGuid(),
+				FGuid());
+			if (OverridePin.LinkedTo.Num() != 0)
+			{
+				Context.AddWarning(FString::Printf(
+					TEXT("Module '%s' input '%s' already has an override graph link; inline curve literal was not applied."),
+					*ModuleNode.GetFunctionName(),
+					*Input.Name));
+				return true;
+			}
+
+			UNiagaraDataInterface* DataInterface = nullptr;
+			FNiagaraStackGraphUtilities::SetDataInterfaceValueForFunctionInput(
+				OverridePin,
+				InputType.GetClass(),
+				MakeAliasedInputHandle(ModuleNode, FName(*Input.Name)).GetParameterHandleString().ToString(),
+				DataInterface);
+
+			UNiagaraDataInterfaceCurveBase* CurveDataInterface = Cast<UNiagaraDataInterfaceCurveBase>(DataInterface);
+			if (!CurveDataInterface)
+			{
+				Context.AddWarning(FString::Printf(
+					TEXT("Module '%s' input '%s' could not create Niagara curve data interface override."),
+					*ModuleNode.GetFunctionName(),
+					*Input.Name));
+				return true;
+			}
+
+			if (!FLiteralParser::ApplyCurveToDataInterface(CurveLiteral, *CurveDataInterface, CurveError))
+			{
+				Context.AddWarning(FString::Printf(
+					TEXT("Module '%s' input '%s' inline curve literal could not be applied: %s"),
+					*ModuleNode.GetFunctionName(),
+					*Input.Name,
+					*CurveError));
+			}
+			return true;
+		}
 	}
 
 	void FModuleInputApplier::ApplyInputs(
@@ -303,6 +384,11 @@ namespace UE::DreamNiagara::SystemEditor::Private
 			}
 
 			if (ApplyLinkedUserParameter(Context, System, InputType, ModuleNode, Input))
+			{
+				continue;
+			}
+
+			if (ApplyCurveLiteral(Context, InputType, ModuleNode, Input))
 			{
 				continue;
 			}
